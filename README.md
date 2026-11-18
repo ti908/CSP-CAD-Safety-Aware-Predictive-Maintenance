@@ -21,6 +21,3 @@ Cost scenarios `(C_FN,C_FP,C_D)`: `(10,1,1)`, `(20,1,2)`, `(30,1,5)`.
 
 The archived configurations are not immutable execution-time evidence. Full-run code/configuration hash provenance has not been verified. Candidate risk/cost coverage curves come from policy-tuning data, not held-out testing. Repeated test folds overlap across repeats. The code has not been rerun as part of this publication preparation.
 
-## Citation
-
-Cite the associated MSc manuscript; no code-specific archival DOI has been verified.

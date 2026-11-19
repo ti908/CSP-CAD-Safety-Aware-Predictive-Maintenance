@@ -1,0 +1,29 @@
+{
+  "run_id": "20261114T203635883859Z_53561323",
+  "model": "RandomForest",
+  "random_seed": 42,
+  "folds_executed": 50,
+  "expected_full_folds": 50,
+  "sanity_only": false,
+  "cost_scenarios": [
+    [
+      10,
+      1,
+      1
+    ],
+    [
+      20,
+      1,
+      2
+    ],
+    [
+      30,
+      1,
+      5
+    ]
+  ],
+  "curve_partition": "policy_tuning",
+  "summary_partition": "test",
+  "configuration": "configs/RandomForest/RFtrain.yaml",
+  "output": "corrected_repeated_cv_results/20261114T203635883859Z_53561323/RandomForest"
+}

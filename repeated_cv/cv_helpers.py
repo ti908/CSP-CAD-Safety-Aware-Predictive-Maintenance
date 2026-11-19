@@ -146,3 +146,58 @@ def evaluate_deferral_policy(
         "total_cost": total_cost,
         "cost_per_sample": cost_per_sample
     }
+
+def diagnose_singleton_agreement(
+    probs, cp_sets, base_threshold, tau
+):
+    """Measure agreement between issued labels and conformal singletons."""
+    import numpy as np
+
+    probs = np.asarray(probs)
+    predictions = (
+        probs[:, 1] >= base_threshold
+    ).astype(int)
+
+    sizes = np.asarray([len(s) for s in cp_sets])
+    singleton = sizes == 1
+
+    certainty = probs.max(axis=1)
+    retained = singleton & (certainty >= tau)
+
+    singleton_labels = np.full(
+        len(cp_sets), -1, dtype=int
+    )
+
+    for i, s in enumerate(cp_sets):
+        if len(s) == 1:
+            singleton_labels[i] = s[0]
+
+    disagreement = (
+        retained & (predictions != singleton_labels)
+    )
+
+    return {
+        "n_observations": len(probs),
+        "n_retained": int(retained.sum()),
+        "n_disagreements": int(disagreement.sum()),
+        "disagreement_fraction_all": float(
+            disagreement.mean()
+        ),
+        "disagreement_fraction_retained": float(
+            disagreement.sum() / retained.sum()
+        ) if retained.any() else np.nan,
+        "predicted_failure_cp_zero": int(
+            (
+                disagreement
+                & (predictions == 1)
+                & (singleton_labels == 0)
+            ).sum()
+        ),
+        "predicted_normal_cp_one": int(
+            (
+                disagreement
+                & (predictions == 0)
+                & (singleton_labels == 1)
+            ).sum()
+        ),
+    }

@@ -1,0 +1,697 @@
+
+
+import numpy as np
+import yaml
+import joblib
+import os
+import pandas as pd
+
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
+from sklearn.model_selection import train_test_split
+from sklearn.calibration import CalibratedClassifierCV
+try:
+    from sklearn.frozen import FrozenEstimator
+except ImportError:
+    FrozenEstimator = None
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+from sklearn.metrics import (
+    brier_score_loss,
+    log_loss,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
+    roc_auc_score,
+    average_precision_score,
+)
+
+from sklearn.tree import DecisionTreeClassifier
+from imblearn.ensemble import RUSBoostClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, average_precision_score
+
+def load_config(config_path="RUStrain.yaml"):
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+#----------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------
+#-----Helper Function Block
+def _to_serializable(obj):
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient="records")
+    if isinstance(obj, pd.Series):
+        return obj.to_list()
+    if isinstance(obj, dict):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_serializable(v) for v in obj]
+    return obj
+
+
+def _quantile_higher(values, q):
+    q = min(max(float(q), 0.0), 1.0)
+    try:
+        return float(np.quantile(values, q, method="higher"))
+    except TypeError:
+        return float(np.quantile(values, q, interpolation="higher"))
+
+
+def compute_conformal_quantile(probs_cal, y_cal, alpha=0.10):
+    """
+    Split conformal for binary classification using:
+        s(x, y) = 1 - p(y|x)
+    """
+    y_cal_arr = np.asarray(y_cal).astype(int)
+    true_class_probs = probs_cal[np.arange(len(y_cal_arr)), y_cal_arr]
+    nonconformity_scores = 1.0 - true_class_probs
+
+    m = len(nonconformity_scores)
+    q_level = np.ceil((m + 1) * (1 - alpha)) / m
+    q_level = min(q_level, 1.0)
+
+    q_alpha = _quantile_higher(nonconformity_scores, q_level)
+
+    return {
+        "alpha": float(alpha),
+        "q_level": float(q_level),
+        "q_alpha": float(q_alpha),
+        "nonconformity_scores": nonconformity_scores
+    }
+
+
+def build_conformal_sets(probs, q_alpha):
+    """
+    For each sample, include class y if 1 - p(y|x) <= q_alpha
+    """
+    cp_sets = []
+    cp_sizes = []
+    cp_ambiguous = []
+
+    for row in probs:
+        label_set = []
+        for y in [0, 1]:
+            score = 1.0 - row[y]
+            if score <= q_alpha:
+                label_set.append(y)
+
+        cp_sets.append(label_set)
+        cp_sizes.append(len(label_set))
+        cp_ambiguous.append(int(len(label_set) != 1))
+
+    return cp_sets, np.array(cp_sizes), np.array(cp_ambiguous)
+
+
+def cp_set_to_str(label_set):
+    return "{" + ",".join(map(str, label_set)) + "}"
+
+
+def summarize_conformal(cp_sets, y_true):
+    y_true_arr = np.asarray(y_true).astype(int)
+    covered = np.array([int(y in s) for y, s in zip(y_true_arr, cp_sets)])
+    sizes = np.array([len(s) for s in cp_sets])
+
+    return {
+        "coverage": float(covered.mean()),
+        "avg_set_size": float(sizes.mean()),
+        "singleton_rate": float((sizes == 1).mean()),
+        "ambiguous_rate": float((sizes > 1).mean()),
+        "empty_set_rate": float((sizes == 0).mean()),
+        "covered_vector": covered,
+        "set_sizes": sizes
+    }
+
+
+def evaluate_deferral_policy(
+    probs,
+    y_true,
+    base_threshold,
+    tau,
+    c_fn,
+    c_fp,
+    c_def,
+    cp_sets=None,
+    defer_on_ambiguous=True
+):
+    """
+    base_threshold: your current class threshold from Step 4
+    tau: certainty threshold for deferral
+    """
+    y_true_arr = np.asarray(y_true).astype(int)
+
+    p1 = probs[:, 1]
+    certainty = probs.max(axis=1)
+    pred_base = (p1 >= base_threshold).astype(int)
+
+    defer_mask = certainty < tau
+
+    if cp_sets is not None and defer_on_ambiguous:
+        cp_sizes = np.array([len(s) for s in cp_sets])
+        defer_mask = defer_mask | (cp_sizes != 1)
+
+    retained_mask = ~defer_mask
+
+    fn = int(((pred_base == 0) & (y_true_arr == 1) & retained_mask).sum())
+    fp = int(((pred_base == 1) & (y_true_arr == 0) & retained_mask).sum())
+    tp = int(((pred_base == 1) & (y_true_arr == 1) & retained_mask).sum())
+    tn = int(((pred_base == 0) & (y_true_arr == 0) & retained_mask).sum())
+    deferred = int(defer_mask.sum())
+
+    total_cost = (c_fn * fn) + (c_fp * fp) + (c_def * deferred)
+    cost_per_sample = total_cost / len(y_true_arr)
+
+    if retained_mask.sum() > 0:
+        retained_error = float((pred_base[retained_mask] != y_true_arr[retained_mask]).mean())
+        retained_recall = float(
+            ((pred_base == 1) & (y_true_arr == 1) & retained_mask).sum() /
+            max(((y_true_arr == 1) & retained_mask).sum(), 1)
+        )
+        retained_precision = float(
+            ((pred_base == 1) & (y_true_arr == 1) & retained_mask).sum() /
+            max(((pred_base == 1) & retained_mask).sum(), 1)
+        )
+    else:
+        retained_error = np.nan
+        retained_recall = np.nan
+        retained_precision = np.nan
+
+    pred_with_deferral = pred_base.copy().astype(int)
+    pred_with_deferral[defer_mask] = -1   # -1 means deferred
+
+    return {
+        "tau": float(tau),
+        "base_threshold": float(base_threshold),
+        "coverage": float(retained_mask.mean()),
+        "deferred_fraction": float(defer_mask.mean()),
+        "deferred_count": deferred,
+        "retained_error": retained_error,
+        "retained_recall": retained_recall,
+        "retained_precision": retained_precision,
+        "fn": fn,
+        "fp": fp,
+        "tp": tp,
+        "tn": tn,
+        "total_cost": float(total_cost),
+        "cost_per_sample": float(cost_per_sample),
+        "pred_base": pred_base,
+        "pred_with_deferral": pred_with_deferral,
+        "certainty": certainty,
+        "defer_mask": defer_mask.astype(int),
+        "retained_mask": retained_mask.astype(int)
+    }
+
+def tune_deferral_threshold(
+    probs_cal,
+    y_cal,
+    base_threshold,
+    tau_values,
+    c_fn,
+    c_fp,
+    c_def,
+    cp_sets_cal=None,
+    defer_on_ambiguous=True
+):
+    rows = []
+
+    for tau in tau_values:
+        res = evaluate_deferral_policy(
+            probs=probs_cal,
+            y_true=y_cal,
+            base_threshold=base_threshold,
+            tau=tau,
+            c_fn=c_fn,
+            c_fp=c_fp,
+            c_def=c_def,
+            cp_sets=cp_sets_cal,
+            defer_on_ambiguous=defer_on_ambiguous
+        )
+
+        rows.append({
+            "tau": res["tau"],
+            "coverage": res["coverage"],
+            "deferred_fraction": res["deferred_fraction"],
+            "retained_error": res["retained_error"],
+            "retained_recall": res["retained_recall"],
+            "retained_precision": res["retained_precision"],
+            "fn": res["fn"],
+            "fp": res["fp"],
+            "deferred_count": res["deferred_count"],
+            "total_cost": res["total_cost"],
+            "cost_per_sample": res["cost_per_sample"]
+        })
+
+    df = pd.DataFrame(rows).sort_values(["cost_per_sample", "tau"], ascending=[True, True]).reset_index(drop=True)
+    best = df.iloc[0].to_dict()
+
+    return df, best
+
+def save_pipeline_artifacts(cfg, model_name, results_dict, dfs_dict):
+    out_dir = Path(cfg["output"]["results_dir"]) / model_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    artifact_paths = {}
+
+    for key, df in dfs_dict.items():
+        csv_path = out_dir / f"{key}.csv"
+        df.to_csv(csv_path, index=False)
+        artifact_paths[key] = str(csv_path)
+
+    summary_path = out_dir / "pipeline_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(_to_serializable(results_dict), f, indent=2)
+
+    artifact_paths["summary_json"] = str(summary_path)
+    return artifact_paths
+#----------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------
+def train_rusboost(config_path="RUStrain.yaml"):
+    cfg = load_config(config_path)
+    # Corrected outputs are isolated from all historical run directories.
+    seed = int(cfg["data"]["random_state"])
+    cost = cfg["deferral"]
+    cost_scenario = f'{cost["c_fn"]:g}/{cost["c_fp"]:g}/{cost["c_def"]:g}'
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + f"_seed{seed}"
+    output_root = Path(__file__).resolve().parents[1] / "corrected_outputs" / cfg["output"]["model_name"] / cost_scenario.replace("/", "_") / run_id
+    cfg["output"]["results_dir"] = str(output_root)
+    cfg["output"]["model_path"] = str(output_root / "calibrated_model.pkl")
+
+
+    # =============================
+    # 1. Load Data
+    # =============================
+    df = pd.read_csv(cfg["data"]["path"])
+    df_model = df.copy()
+
+    # =============================
+    # 2. Preprocessing
+    # =============================
+    if cfg["preprocessing"]["encode_product_id"]:
+        df_model["Product_ID"] = df_model["Product ID"].str[0]
+        encoder = LabelEncoder()
+        df_model["Product_ID"] = encoder.fit_transform(df_model["Product_ID"])
+
+    X_raw = df_model[cfg["features"]["input"]]
+    y = df_model[cfg["features"]["target"]].astype(int)
+
+    X = X_raw.copy()
+
+    # =============================
+    # 3. STRATIFIED SPLITS
+    # =============================
+    # 50/10/10/10/20 stratified split: test never enters fitting or tuning.
+    X_dev, X_test, y_dev, y_test = train_test_split(
+        X, y, test_size=0.20, stratify=y, random_state=seed
+    )
+    X_train, X_hold, y_train, y_hold = train_test_split(
+        X_dev, y_dev, test_size=0.375, stratify=y_dev, random_state=seed + 1
+    )
+    X_prob_cal, X_rest, y_prob_cal, y_rest = train_test_split(
+        X_hold, y_hold, test_size=2 / 3, stratify=y_hold, random_state=seed + 2
+    )
+    X_cp_cal, X_tune, y_cp_cal, y_tune = train_test_split(
+        X_rest, y_rest, test_size=0.50, stratify=y_rest, random_state=seed + 3
+    )
+    partitions = {
+        "train": (X_train, y_train),
+        "probability_calibration": (X_prob_cal, y_prob_cal),
+        "conformal_calibration": (X_cp_cal, y_cp_cal),
+        "policy_tuning": (X_tune, y_tune),
+        "test": (X_test, y_test),
+    }
+    partition_stats = {
+        label: {"size": len(labels), "positive_count": int(np.asarray(labels).sum())}
+        for label, (_, labels) in partitions.items()
+    }
+    assert sum(v["size"] for v in partition_stats.values()) == len(y)
+    assert len(set().union(*(set(frame.index) for frame, _ in partitions.values()))) == len(y)
+    assert all(set(partitions[a][0].index).isdisjoint(partitions[b][0].index)
+               for a in partitions for b in partitions if a != b)
+    print("CORRECTED PARTITIONS:", partition_stats)
+    if cfg["preprocessing"]["scale"]:
+        scaler = StandardScaler().fit(X_train)
+        X_train, X_prob_cal, X_cp_cal, X_tune, X_test = [
+            pd.DataFrame(scaler.transform(frame), columns=frame.columns, index=frame.index)
+            for frame in (X_train, X_prob_cal, X_cp_cal, X_tune, X_test)
+        ]
+
+
+    # =============================
+    # 4. Train Model
+    # =============================
+    base_model = RUSBoostClassifier(
+        estimator=DecisionTreeClassifier(
+            max_depth=cfg["model"]["estimator"]["max_depth"],
+            random_state=cfg["model"]["random_state"]
+        ),
+        n_estimators=cfg["model"]["n_estimators"],
+        learning_rate=cfg["model"]["learning_rate"],
+        random_state=cfg["model"]["random_state"]
+    )
+
+    base_model.fit(X_train, y_train)
+
+    # =============================
+    # 5. Calibration
+    # =============================
+    calibrated_model = CalibratedClassifierCV(
+        FrozenEstimator(base_model) if FrozenEstimator is not None else base_model,
+        method=cfg["calibration"]["method"],
+        cv="prefit" if FrozenEstimator is None else None
+    )
+    calibrated_model.fit(X_prob_cal, y_prob_cal)
+
+    # =============================
+    # 6. Choose Threshold (on calibration set)
+    # =============================
+    cal_proba = calibrated_model.predict_proba(X_tune)[:, 1]
+
+    tmin = cfg["threshold"]["search_min"]
+    tmax = cfg["threshold"]["search_max"]
+    steps = cfg["threshold"]["steps"]
+    thresholds = np.linspace(tmin, tmax, steps)
+
+    best_threshold = 0.5
+    best_score = -1
+
+    from sklearn.metrics import recall_score, precision_score
+
+    TARGET_RECALL = cfg["threshold"].get("target_recall", 0.90)
+
+    best_threshold = None
+    best_precision = -1
+
+    for t in thresholds:
+        preds = (cal_proba >= t).astype(int)
+
+        recall = recall_score(y_tune, preds)
+        precision = precision_score(y_tune, preds, zero_division=0)
+
+        # Keep only thresholds that satisfy recall requirement
+        if recall >= TARGET_RECALL:
+            if precision > best_precision:
+                best_precision = precision
+                best_threshold = t
+
+    # 🔴 SAFETY FALLBACK (important)
+    if best_threshold is None:
+        print("WARNING: No threshold meets target recall. Falling back to max recall.")
+
+        best_threshold = thresholds[0]
+        best_score = -1
+
+        for t in thresholds:
+            preds = (cal_proba >= t).astype(int)
+            recall = recall_score(y_tune, preds)
+
+            if recall > best_score:
+                best_score = recall
+                best_threshold = t
+
+    # DEBUG OUTPUT
+    print(f"Chosen Threshold: {best_threshold}")
+    print(f"Calibration Recall: {recall_score(y_tune, (cal_proba >= best_threshold)):.4f}")
+    print(f"Calibration Precision: {precision_score(y_tune, (cal_proba >= best_threshold), zero_division=0):.4f}")
+
+    # =============================
+    # 8. Step 5: Certainty + calibration tracking
+    # =============================
+    probs_cal = calibrated_model.predict_proba(X_cp_cal)
+    certainty_cp_cal = probs_cal.max(axis=1)
+
+    step5_calibration = {
+        "brier_score": float(brier_score_loss(y_cp_cal, probs_cal[:, 1])),
+        "log_loss": float(log_loss(y_cp_cal, probs_cal[:, 1], labels=[0, 1])),
+        "certainty_mean": float(np.mean(certainty_cp_cal)),
+        "certainty_median": float(np.median(certainty_cp_cal)),
+        "certainty_min": float(np.min(certainty_cp_cal)),
+        "certainty_max": float(np.max(certainty_cp_cal))
+    }
+
+    # =============================
+    # 9. Step 6: Split conformal prediction
+    # =============================
+    alpha = cfg["conformal"]["alpha"]
+
+    conformal_info = compute_conformal_quantile(
+        probs_cal=probs_cal,
+        y_cal=y_cp_cal,
+        alpha=alpha
+    )
+
+    cp_sets_cal, cp_sizes_cal, cp_amb_cal = build_conformal_sets(
+        probs_cal,
+        conformal_info["q_alpha"]
+    )
+
+    cp_summary_cal = summarize_conformal(cp_sets_cal, y_cp_cal)
+    step6_conformal_cal = {
+        "alpha": float(alpha),
+        "q_level": float(conformal_info["q_level"]),
+        "q_alpha": float(conformal_info["q_alpha"]),
+        "coverage_cal": float(cp_summary_cal["coverage"]),
+        "avg_set_size_cal": float(cp_summary_cal["avg_set_size"]),
+        "singleton_rate_cal": float(cp_summary_cal["singleton_rate"]),
+        "ambiguous_rate_cal": float(cp_summary_cal["ambiguous_rate"]),
+        "empty_set_rate_cal": float(cp_summary_cal["empty_set_rate"])
+    }
+
+    # =============================
+    # 10. Step 7: Cost-aware deferral threshold on calibration set
+    # =============================
+    tau_values = np.linspace(
+        cfg["deferral"]["tau_min"],
+        cfg["deferral"]["tau_max"],
+        cfg["deferral"]["steps"]
+    )
+
+    probs_tune = calibrated_model.predict_proba(X_tune)
+    cp_sets_tune, cp_sizes_tune, cp_amb_tune = build_conformal_sets(probs_tune, conformal_info["q_alpha"])
+    cp_summary_tune = summarize_conformal(cp_sets_tune, y_tune)
+
+    deferral_search_df, best_deferral = tune_deferral_threshold(
+        probs_cal=probs_tune,
+        y_cal=y_tune,
+        base_threshold=best_threshold,
+        tau_values=tau_values,
+        c_fn=cfg["deferral"]["c_fn"],
+        c_fp=cfg["deferral"]["c_fp"],
+        c_def=cfg["deferral"]["c_def"],
+        cp_sets_cal=cp_sets_tune,
+        defer_on_ambiguous=cfg["conformal"]["defer_on_ambiguous"]
+    )
+
+    step7_deferral = {
+        "best_tau": float(best_deferral["tau"]),
+        "best_cost_per_sample": float(best_deferral["cost_per_sample"]),
+        "best_total_cost": float(best_deferral["total_cost"]),
+        "coverage_at_best_tau": float(best_deferral["coverage"]),
+        "deferred_fraction_at_best_tau": float(best_deferral["deferred_fraction"]),
+        "retained_error_at_best_tau": (
+            None if pd.isna(best_deferral["retained_error"]) else float(best_deferral["retained_error"])
+        ),
+        "retained_recall_at_best_tau": (
+            None if pd.isna(best_deferral["retained_recall"]) else float(best_deferral["retained_recall"])
+        ),
+        "retained_precision_at_best_tau": (
+            None if pd.isna(best_deferral["retained_precision"]) else float(best_deferral["retained_precision"])
+        )
+    }
+
+    print(f"Best deferral tau: {step7_deferral['best_tau']:.4f}")
+    print(f"Deferral cost/sample: {step7_deferral['best_cost_per_sample']:.4f}")
+    print(f"Coverage at best tau: {step7_deferral['coverage_at_best_tau']:.4f}")
+
+    # =============================
+    # 11. Step 8 + Step 9: Final held-out test evaluation
+    # =============================
+    #probs_test = calibrated_model.predict_proba(X_test) if "calibrated_model" in locals() else calibrated_rf.predict_proba(X_test)
+    probs_test = calibrated_model.predict_proba(X_test)
+    certainty_test = probs_test.max(axis=1)
+
+    cp_sets_test, cp_sizes_test, cp_amb_test = build_conformal_sets(
+        probs_test,
+        conformal_info["q_alpha"]
+    )
+
+    cp_summary_test = summarize_conformal(cp_sets_test, y_test)
+
+    final_policy = evaluate_deferral_policy(
+        probs=probs_test,
+        y_true=y_test,
+        base_threshold=best_threshold,
+        tau=step7_deferral["best_tau"],
+        c_fn=cfg["deferral"]["c_fn"],
+        c_fp=cfg["deferral"]["c_fp"],
+        c_def=cfg["deferral"]["c_def"],
+        cp_sets=cp_sets_test,
+        defer_on_ambiguous=cfg["conformal"]["defer_on_ambiguous"]
+    )
+
+    y_pred_test = (probs_test[:, 1] >= best_threshold).astype(int)
+    y_proba_test = probs_test[:, 1]
+
+    retained_mask_test = final_policy["retained_mask"].astype(bool)
+
+    if retained_mask_test.sum() > 0:
+        retained_cm = confusion_matrix(y_test[retained_mask_test], y_pred_test[retained_mask_test])
+        retained_report = classification_report(
+            y_test[retained_mask_test],
+            y_pred_test[retained_mask_test],
+            output_dict=True,
+            zero_division=0
+        )
+    else:
+        retained_cm = np.array([[0, 0], [0, 0]])
+        retained_report = {}
+
+    step9_final_eval = {
+        "overall_test": {
+            "confusion_matrix": confusion_matrix(y_test, y_pred_test),
+            "classification_report": classification_report(y_test, y_pred_test, output_dict=True, zero_division=0),
+            "roc_auc": float(roc_auc_score(y_test, y_proba_test)),
+            "pr_auc": float(average_precision_score(y_test, y_proba_test)),
+            "base_threshold": float(best_threshold)
+        },
+        "conformal_test": {
+            "coverage_test": float(cp_summary_test["coverage"]),
+            "avg_set_size_test": float(cp_summary_test["avg_set_size"]),
+            "singleton_rate_test": float(cp_summary_test["singleton_rate"]),
+            "ambiguous_rate_test": float(cp_summary_test["ambiguous_rate"]),
+            "empty_set_rate_test": float(cp_summary_test["empty_set_rate"])
+        },
+        "selective_prediction_test": {
+            "tau": float(final_policy["tau"]),
+            "coverage": float(final_policy["coverage"]),
+            "deferred_fraction": float(final_policy["deferred_fraction"]),
+            "deferred_count": int(final_policy["deferred_count"]),
+            "retained_error": (
+                None if pd.isna(final_policy["retained_error"]) else float(final_policy["retained_error"])
+            ),
+            "retained_recall": (
+                None if pd.isna(final_policy["retained_recall"]) else float(final_policy["retained_recall"])
+            ),
+            "retained_precision": (
+                None if pd.isna(final_policy["retained_precision"]) else float(final_policy["retained_precision"])
+            ),
+            "fn": int(final_policy["fn"]),
+            "fp": int(final_policy["fp"]),
+            "tp": int(final_policy["tp"]),
+            "tn": int(final_policy["tn"]),
+            "total_cost": float(final_policy["total_cost"]),
+            "cost_per_sample": float(final_policy["cost_per_sample"]),
+            "retained_confusion_matrix": retained_cm,
+            "retained_classification_report": retained_report
+        }
+    }
+
+    # =============================
+    # 12. Save step-by-step artifacts
+    # =============================
+    cal_df = pd.DataFrame({
+        "row_id": X_cp_cal.index,
+        "y_true": np.asarray(y_cp_cal).astype(int),
+        "p0": probs_cal[:, 0],
+        "p1": probs_cal[:, 1],
+        "certainty": certainty_cp_cal,
+        "cp_set": [cp_set_to_str(s) for s in cp_sets_cal],
+        "cp_set_size": cp_sizes_cal,
+        "cp_ambiguous": cp_amb_cal,
+        "cp_covered": cp_summary_cal["covered_vector"]
+    })
+
+    test_df = pd.DataFrame({
+        "row_id": X_test.index,
+        "y_true": np.asarray(y_test).astype(int),
+        "p0": probs_test[:, 0],
+        "p1": probs_test[:, 1],
+        "certainty": certainty_test,
+        "base_pred": y_pred_test,
+        "final_pred_with_deferral": final_policy["pred_with_deferral"],
+        "deferred": final_policy["defer_mask"],
+        "retained": final_policy["retained_mask"],
+        "cp_set": [cp_set_to_str(s) for s in cp_sets_test],
+        "cp_set_size": cp_sizes_test,
+        "cp_ambiguous": cp_amb_test,
+        "cp_covered": cp_summary_test["covered_vector"]
+    })
+
+    tune_df = pd.DataFrame({
+        "row_id": X_tune.index,
+        "y_true": np.asarray(y_tune).astype(int),
+        "p0": probs_tune[:, 0], "p1": probs_tune[:, 1],
+        "certainty": probs_tune.max(axis=1),
+        "base_pred": (probs_tune[:, 1] >= best_threshold).astype(int),
+        "cp_set": [cp_set_to_str(v) for v in cp_sets_tune],
+        "cp_set_size": cp_sizes_tune, "cp_ambiguous": cp_amb_tune,
+        "cp_covered": cp_summary_tune["covered_vector"],
+    })
+    provenance = {
+        "run_id": run_id, "random_seed": seed,
+        "cost_scenario": cost_scenario,
+        "C_FN": float(cost["c_fn"]), "C_FP": float(cost["c_fp"]),
+        "C_DEF": float(cost["c_def"]), "partition_stats": partition_stats,
+        "base_threshold": float(best_threshold),
+        "q_alpha": float(conformal_info["q_alpha"]),
+        "tau": float(step7_deferral["best_tau"]),
+    }
+    for frame, partition_name in ((cal_df, "conformal_calibration"),
+                                  (tune_df, "policy_tuning"),
+                                  (test_df, "test"),
+                                  (deferral_search_df, "policy_tuning")):
+        frame["partition"] = partition_name
+        for key in ("run_id", "random_seed", "cost_scenario", "C_FN", "C_FP", "C_DEF",
+                    "base_threshold", "q_alpha", "tau"):
+            frame[key] = provenance[key]
+        for key, counts in partition_stats.items():
+            frame[f"n_{key}"] = counts["size"]
+            frame[f"positive_{key}"] = counts["positive_count"]
+
+    results = {
+        "provenance": provenance,
+
+        "model": "RUSBoost",
+
+        "step4_thresholding": {
+            "base_threshold": float(best_threshold),
+            "target_recall": float(cfg["threshold"]["target_recall"])
+        },
+        "step5_calibration": step5_calibration,
+        "step6_conformal_calibration": step6_conformal_cal,
+        "step7_deferral_tuning": step7_deferral,
+        "step9_final_evaluation": step9_final_eval
+    }
+
+    if cfg["output"].get("save_step_artifacts", True):
+        artifact_paths = save_pipeline_artifacts(
+            cfg=cfg,
+            model_name=cfg["output"]["model_name"],
+            results_dict=results,
+            dfs_dict={
+                "step5_step6_calibration_records": cal_df,
+                "step7_tuning_predictions": tune_df,
+                "step7_deferral_search": deferral_search_df,
+                "step9_test_predictions": test_df
+            }
+        )
+        results["artifact_paths"] = artifact_paths
+
+    # =============================
+    # 6. Save model
+    # =============================
+    if cfg["output"]["save_model"]:
+        os.makedirs(os.path.dirname(cfg["output"]["model_path"]), exist_ok=True)
+        joblib.dump(calibrated_model, cfg["output"]["model_path"])
+
+    return base_model, calibrated_model, X_test, y_test, y_pred_test, y_proba_test, results

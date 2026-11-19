@@ -1,9 +1,53 @@
-__pycache__/
-*.pyc
+
+# Python environments and caches
 .venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Credentials and local environment configuration
 .env
 .env.*
-.ipynb_checkpoints/
+!.env.example
+*.pem
+*.key
+*credentials*.json
+*secrets*.json
+
+# Temporary files and logs
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Local archives
+Step4_Validation_Results.zip
+
+# Generated model binaries
 *.pkl
 *.joblib
-.DS_Store
+*.pt
+*.pth
+*.onnx
+*.h5
+
+# Local notebook backup created before path cleanup
+RepeatedStratifiedCV_SafetyAware_Evaluation_CORRECTED.pre_path_cleanup.ipynb
+
+# Local backup of cost-aware conformal evaluation notebook
+Cost-Aware Conformal Deferral Framework Evaluation_CORRECTED.pre_path_cleanup.ipynb
+
+# Local policy manifest backup
+corrected_policy_outputs/20261115T190522567778Z_policy_eval/evaluation_manifest.pre_path_cleanup.json

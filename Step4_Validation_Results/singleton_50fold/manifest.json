@@ -1,0 +1,7 @@
+{
+  "scenario": "20_1_2",
+  "folds_per_model": 50,
+  "baseline_csv": "Step4_Validation_Results/all_models_50fold_summary.csv",
+  "counterfactual": "fixed singleton label on retained rows; no test-set tuning",
+  "note": "Overlapping repeated-CV test folds are not independent replicates"
+}

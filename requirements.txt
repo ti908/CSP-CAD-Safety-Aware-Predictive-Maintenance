@@ -1,0 +1,15 @@
+# CSP-CAD corrected research implementation
+# Original environment: Python 3.13.5
+# Versions sourced from original_environment_requirements.txt
+# Clean-environment installation not yet independently tested
+
+numpy==2.5.4
+pandas==3.1.1
+scikit-learn==1.9.1
+imbalanced-learn==0.14.2
+xgboost==3.4.1
+scipy==1.18.1
+PyYAML==6.0.3
+joblib==1.6.0
+matplotlib==3.11.2
+ipython==9.18.1
